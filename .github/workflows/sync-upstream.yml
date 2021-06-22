@@ -1,0 +1,133 @@
+name: Sync with upstream
+
+on:
+  schedule:
+  - cron: "0 * * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - name: Sync with upstream
+      id: sync_upstream
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        cat <<- EOF > $HOME/.netrc
+        machine github.com
+        login $GITHUB_ACTOR
+        password $GITHUB_TOKEN
+        machine api.github.com
+        login $GITHUB_ACTOR
+        password $GITHUB_TOKEN
+        EOF
+        chmod 600 $HOME/.netrc
+
+        set -x
+
+        git config --global user.email 'actions@github.com'
+        git config --global user.name 'GitHub Actions'
+        git remote add upstream https://github.com/microsoft/WSL2-Linux-Kernel.git
+        git fetch origin --tags
+        git fetch upstream
+        git fetch upstream --tags
+        git rebase upstream/master
+        git push --force        origin HEAD:master
+        git push --force --tags origin
+
+    - name: Build and Create release tag
+      id: build_and_tag
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        cat <<- EOF > $HOME/.netrc
+        machine github.com
+        login $GITHUB_ACTOR
+        password $GITHUB_TOKEN
+        machine api.github.com
+        login $GITHUB_ACTOR
+        password $GITHUB_TOKEN
+        EOF
+        chmod 600 $HOME/.netrc
+
+        set -x
+
+        sudo apt-get update && sudo apt-get install -yqq \
+          build-essential \
+          bison \
+          flex \
+          libelf-dev \
+          gcc-aarch64-linux-gnu
+
+        TAGS_TO_CONSIDER=$(git tag -l 'linux-msft-*')
+        for TAG in $TAGS_TO_CONSIDER; do
+          if [ -n "$TAG" ] && echo "$TAG" | grep -Eq '^linux-msft-([0-9]+\.[0-9]+).*$'; then
+            SNAPD_TAG="${TAG/linux-msft-/linux-msft-snapd-}"
+            if [ -z "$(git tag -l "$SNAPD_TAG")" ]; then
+              MINOR_VER="$(echo "$TAG" | sed -Ee 's/^linux-msft-([0-9]+\.[0-9]+).*$/\1/')"
+              BRANCH="origin/snapd-support-$MINOR_VER.y"
+              git fetch origin
+              git reset --hard "$TAG"
+              git checkout --force "$TAG"
+              git checkout --force "$BRANCH" -- \
+                arch/x86/configs/wsl2_defconfig \
+                arch/arm64/configs/wsl2_defconfig \
+                arch/x86/configs/snap_support.config \
+                arch/arm64/configs/snap_support.config
+
+              if [ ! -f Microsoft/config-wsl ]; then
+                continue
+              fi
+              make ARCH=x86_64 wsl2_defconfig snap_support.config
+              make -j$(nproc) ARCH=x86_64 && echo "::set-output name=build_x86_64::true" || continue
+
+              if [ -f Microsoft/config-wsl-arm64 ]; then
+                make ARCH=arm64 wsl2_defconfig snap_support.config
+                make -j$(nproc) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- && echo "::set-output name=build_arm64::true" || true
+              fi
+
+              git tag -f "$SNAPD_TAG"
+              git push --tags --force
+              echo "::set-output name=build_tag::$SNAPD_TAG"
+
+              exit 0
+            fi
+          fi
+        done
+
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      if: steps.build_and_tag.outputs.build_tag
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.build_and_tag.outputs.build_tag }}
+        release_name: Release ${{ steps.build_and_tag.outputs.build_tag }}
+        draft: false
+        prerelease: false
+    - name: Upload x86_64 Release Asset
+      id: upload-x86_64-release-asset
+      uses: actions/upload-release-asset@v1
+      if: steps.create_release.outputs.upload_url && steps.build_and_tag.outputs.build_x86_64
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }} # This pulls from the CREATE RELEASE step above, referencing it's ID to get its outputs object, which include a `upload_url`. See this blog post for more info: https://jasonet.co/posts/new-features-of-github-actions/#passing-data-to-future-steps 
+        asset_path: ./arch/x86/boot/bzImage
+        asset_name: vmlinux-wsl2-snapd-x86_64
+        asset_content_type: application/octet-stream
+    - name: Upload arm64 Release Asset
+      id: upload-arm64-release-asset
+      uses: actions/upload-release-asset@v1
+      if: steps.create_release.outputs.upload_url && steps.build_and_tag.outputs.build_arm64
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }} # This pulls from the CREATE RELEASE step above, referencing it's ID to get its outputs object, which include a `upload_url`. See this blog post for more info: https://jasonet.co/posts/new-features-of-github-actions/#passing-data-to-future-steps 
+        asset_path: ./arch/arm64/boot/Image.gz
+        asset_name: vmlinux-wsl2-snapd-arm64
+        asset_content_type: application/octet-stream
